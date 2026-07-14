@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amazon Payout Console</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark" aria-hidden="true">AP</div>
+    <div class="brand-copy">
+      <h1>Amazon Payout Console</h1>
+      <span>本地结算控制台</span>
+    </div>
+    <div class="topbar-status" aria-live="polite">
+      <span id="modeBadge" class="badge neutral">未连接</span>
+      <span id="dryRunBadge" class="badge neutral">状态未知</span>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section id="authPanel" class="auth-band" aria-labelledby="authTitle">
+      <div>
+        <h2 id="authTitle">控制台访问</h2>
+        <p>API Key</p>
+      </div>
+      <form id="authForm" class="auth-form">
+        <label class="sr-only" for="apiKeyInput">API Key</label>
+        <input id="apiKeyInput" name="apiKey" type="password" autocomplete="current-password" required>
+        <button type="submit" class="button primary">连接</button>
+      </form>
+    </section>
+
+    <div id="workspace" hidden>
+      <section class="section-band" aria-labelledby="statusTitle">
+        <div class="section-heading">
+          <div>
+            <h2 id="statusTitle">运行状态</h2>
+            <p id="statusTimestamp">等待刷新</p>
+          </div>
+          <button id="testCredentialsButton" type="button" class="button secondary">测试连接</button>
+        </div>
+        <div id="productionWarning" class="risk-banner" hidden>
+          <strong>生产模式</strong>
+          <span>真实提交取决于服务器安全开关和站点白名单。</span>
+        </div>
+        <div class="status-grid">
+          <div class="metric"><span>服务</span><strong id="serviceStatus">-</strong></div>
+          <div class="metric"><span>凭证</span><strong id="credentialStatus">-</strong></div>
+          <div class="metric"><span>调度器</span><strong id="schedulerStatus">-</strong></div>
+          <div class="metric"><span>时区</span><strong id="timezoneStatus">-</strong></div>
+          <div class="metric wide"><span>最近连接测试</span><strong id="connectionStatus">尚未测试</strong></div>
+        </div>
+      </section>
+
+      <section class="section-band" aria-labelledby="marketplaceTitle">
+        <div class="section-heading">
+          <div>
+            <h2 id="marketplaceTitle">站点操作</h2>
+            <p>UK、US、CA 不支持 Transfers API 主动提现</p>
+          </div>
+        </div>
+        <div class="marketplace-toolbar">
+          <label class="select-all-control"><input id="selectAllMarketplaces" type="checkbox" checked> 全选站点</label>
+          <span id="selectedMarketplaceCount">已选择 8 个站点</span>
+        </div>
+        <div id="marketplaceChecklist" class="marketplace-checklist" aria-label="提现站点"></div>
+        <div class="action-row batch-actions">
+          <button id="paymentMethodsButton" type="button" class="button secondary">查询选中收款方式</button>
+          <button id="previewButton" type="button" class="button primary">批量执行预演</button>
+        </div>
+        <div id="operationResult" class="result-strip" aria-live="polite">尚未执行操作</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>站点</th><th>类型</th><th>国家</th><th>默认方式</th><th>尾号</th></tr>
+            </thead>
+            <tbody id="paymentMethodsBody">
+              <tr><td colspan="5" class="empty-cell">暂无收款方式数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap batch-result-wrap">
+          <table>
+            <thead><tr><th>站点</th><th>操作</th><th>结果</th><th>详情</th></tr></thead>
+            <tbody id="batchResultsBody"><tr><td colspan="4" class="empty-cell">暂无批量执行结果</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section-band" aria-labelledby="financeTitle">
+        <div class="section-heading">
+          <div>
+            <h2 id="financeTitle">财务汇总</h2>
+            <p id="financeSyncStatus">尚未同步 Amazon 财务记录</p>
+          </div>
+          <div class="heading-actions">
+            <button id="syncFinanceButton" type="button" class="button secondary">同步 Amazon</button>
+            <button id="exportFinanceButton" type="button" class="button secondary">导出 CSV</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <label for="financeDays">期间</label>
+          <select id="financeDays">
+            <option value="30">最近 30 天</option>
+            <option value="90">最近 90 天</option>
+            <option value="180" selected>最近 180 天</option>
+          </select>
+          <label for="financeCurrency">币种</label>
+          <select id="financeCurrency">
+            <option value="">全部币种</option>
+            <option value="EUR">EUR</option>
+            <option value="GBP">GBP</option>
+            <option value="USD">USD</option>
+          </select>
+          <label for="financeTransferStatus">转账状态</label>
+          <select id="financeTransferStatus">
+            <option value="">全部状态</option>
+            <option value="Succeeded">Succeeded</option>
+            <option value="Unknown">Unknown</option>
+          </select>
+          <button id="refreshFinanceButton" type="button" class="button primary">应用筛选</button>
+        </div>
+        <div id="financeSummary" class="finance-summary">
+          <div class="empty-summary">暂无财务汇总</div>
+        </div>
+        <div id="financeCharts" class="finance-charts">
+          <div class="empty-summary">暂无趋势数据</div>
+        </div>
+        <div class="table-wrap">
+          <table class="finance-table">
+            <thead>
+              <tr><th>转账日期</th><th>站点</th><th>状态</th><th>原币金额</th><th>到账金额</th><th>银行尾号</th><th>追踪编号</th></tr>
+            </thead>
+            <tbody id="financeBody">
+              <tr><td colspan="7" class="empty-cell">暂无提现台账</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section-band" aria-labelledby="scheduleTitle">
+        <div class="section-heading">
+          <div>
+            <h2 id="scheduleTitle">每日任务</h2>
+            <p id="scheduleTimezone">-</p>
+          </div>
+          <button id="refreshSchedulesButton" type="button" class="button secondary">刷新</button>
+        </div>
+        <div class="table-wrap">
+          <table class="schedule-table">
+            <thead>
+              <tr><th>站点</th><th>启用</th><th>执行时间</th><th>下次执行</th><th>操作</th></tr>
+            </thead>
+            <tbody id="schedulesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section-band" aria-labelledby="historyTitle">
+        <div class="section-heading">
+          <div>
+            <h2 id="historyTitle">执行历史</h2>
+            <p>最近 100 条记录</p>
+          </div>
+          <button id="refreshHistoryButton" type="button" class="button secondary">刷新</button>
+        </div>
+        <div class="table-wrap">
+          <table class="history-table">
+            <thead>
+              <tr><th>时间</th><th>站点</th><th>来源</th><th>状态</th><th>请求或错误</th></tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr><td colspan="5" class="empty-cell">暂无执行记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
