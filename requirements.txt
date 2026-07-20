@@ -1,0 +1,2 @@
+selenium==4.46.0
+tzdata==2026.3
