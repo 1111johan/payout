@@ -1,9 +1,11 @@
 const MARKETPLACES = ["BE", "DE", "ES", "FR", "IT", "NL", "PL", "SE"];
 const ZINIAO_MARKETPLACES = ["US", "UK", "CA"];
 const ALL_MARKETPLACES = [...ZINIAO_MARKETPLACES, ...MARKETPLACES];
+const SCHEDULE_MARKETPLACES = ALL_MARKETPLACES;
 
 const state = {
   apiKey: sessionStorage.getItem("amazonPayoutApiKey") || "",
+  connected: false,
   status: null,
   schedules: new Map(),
   financeRecords: [],
@@ -67,6 +69,9 @@ const elements = {
   financeCharts: document.querySelector("#financeCharts"),
   financeBody: document.querySelector("#financeBody"),
   scheduleTimezone: document.querySelector("#scheduleTimezone"),
+  scheduleSelectAll: document.querySelector("#scheduleSelectAll"),
+  scheduleBulkTime: document.querySelector("#scheduleBulkTime"),
+  scheduleBulkSaveButton: document.querySelector("#scheduleBulkSaveButton"),
   schedulesBody: document.querySelector("#schedulesBody"),
   refreshSchedulesButton: document.querySelector("#refreshSchedulesButton"),
   historyBody: document.querySelector("#historyBody"),
@@ -112,7 +117,7 @@ function primaryMarketplace() {
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  headers.set("X-API-Key", state.apiKey);
+  if (state.apiKey) headers.set("X-API-Key", state.apiKey);
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers });
   let payload;
@@ -132,6 +137,7 @@ async function api(path, options = {}) {
 }
 
 function disconnect() {
+  state.connected = false;
   state.apiKey = "";
   sessionStorage.removeItem("amazonPayoutApiKey");
   elements.workspace.hidden = true;
@@ -237,6 +243,28 @@ function ziniaoMarketplace(store) {
   return "";
 }
 
+function isAmazonZiniaoStore(store) {
+  const source = `${store.platformName || ""} ${store.browserName || ""}`.toUpperCase();
+  return source.includes("亚马逊") || source.includes("AMAZON") || ZINIAO_MARKETPLACES.includes(ziniaoMarketplace(store));
+}
+
+function ziniaoStoreForMarketplace(stores, marketplace) {
+  const available = stores.filter((store) => !store.isExpired);
+  return available.find((store) => ziniaoMarketplace(store) === marketplace)
+    || available.find((store) => isAmazonZiniaoStore(store));
+}
+
+function ziniaoStoreRows(stores) {
+  const marketplaceRows = ZINIAO_MARKETPLACES
+    .map((marketplace) => ({ marketplace, store: ziniaoStoreForMarketplace(stores, marketplace) }))
+    .filter((item) => item.store);
+  const assignedStores = new Set(marketplaceRows.map((item) => item.store));
+  const otherRows = stores
+    .filter((store) => !assignedStores.has(store))
+    .map((store) => ({ marketplace: ziniaoMarketplace(store), store }));
+  return [...marketplaceRows, ...otherRows];
+}
+
 function allSiteDefault(marketplace) {
   return {
     marketplace,
@@ -305,18 +333,18 @@ function renderZiniaoStores(stores, runningStores = []) {
     elements.ziniaoStoresBody.innerHTML = '<tr><td colspan="7" class="empty-cell">当前自动化账号没有可控制店铺</td></tr>';
     return;
   }
-  elements.ziniaoStoresBody.replaceChildren(...stores.map((store) => {
+  const renderedEnvironmentControls = new Set();
+  elements.ziniaoStoresBody.replaceChildren(...ziniaoStoreRows(stores).map(({ store, marketplace }) => {
     const row = document.createElement("tr");
     const running = ziniaoStoreKeys(store).map((key) => state.ziniaoRunning.get(key)).find(Boolean);
-    const marketplace = ziniaoMarketplace(store);
-    const balance = state.ziniaoBalances.get(ziniaoBalanceKey(store, marketplace));
+    const balance = marketplace ? state.ziniaoBalances.get(ziniaoBalanceKey(store, marketplace)) : null;
     const values = [
       store.browserName || "-",
-      store.platformName || store.platformId || "-",
-      store.siteId || "-",
+      marketplace ? `Amazon - ${marketplace}` : (store.platformName || store.platformId || "-"),
+      marketplace || store.siteId || "-",
       store.isExpired ? "代理已过期" : "正常",
       running?.debuggingPort || "-",
-      balance?.totalAvailable || "-",
+      balance ? ziniaoAccountsFunds(balance) : "-",
     ];
     values.forEach((value, index) => {
       const cell = document.createElement("td");
@@ -327,13 +355,17 @@ function renderZiniaoStores(stores, runningStores = []) {
     const actionCell = document.createElement("td");
     const actions = document.createElement("div");
     actions.className = "row-actions";
-    const environmentButton = document.createElement("button");
-    environmentButton.type = "button";
-    environmentButton.className = `button small ${running ? "danger" : "secondary"}`;
-    environmentButton.textContent = running ? "停止" : "启动";
-    environmentButton.disabled = Boolean(store.isExpired);
-    environmentButton.addEventListener("click", () => controlZiniaoStore(store, running, environmentButton));
-    actions.appendChild(environmentButton);
+    const environmentKey = ziniaoStoreKey(store);
+    if (!renderedEnvironmentControls.has(environmentKey)) {
+      renderedEnvironmentControls.add(environmentKey);
+      const environmentButton = document.createElement("button");
+      environmentButton.type = "button";
+      environmentButton.className = `button small ${running ? "danger" : "secondary"}`;
+      environmentButton.textContent = running ? "停止" : "启动";
+      environmentButton.disabled = Boolean(store.isExpired);
+      environmentButton.addEventListener("click", () => controlZiniaoStore(store, running, environmentButton));
+      actions.appendChild(environmentButton);
+    }
     if (running && marketplace) {
       const balanceButton = document.createElement("button");
       balanceButton.type = "button";
@@ -344,8 +376,8 @@ function renderZiniaoStores(stores, runningStores = []) {
       payoutButton.type = "button";
       payoutButton.className = "button small primary";
       payoutButton.textContent = "申请付款";
-      const standardBalance = (balance?.accounts || []).find((item) => item.index === 0);
-      payoutButton.disabled = !state.status?.ziniaoPayoutEnabled || Boolean(standardBalance && !standardBalance.canRequest);
+      const requestableAccounts = ziniaoRequestableAccounts(balance);
+      payoutButton.disabled = !state.status?.ziniaoPayoutEnabled || Boolean(balance && !requestableAccounts.length);
       payoutButton.addEventListener("click", () => prepareZiniaoPayout(store, running, marketplace, payoutButton));
       actions.append(balanceButton, payoutButton);
     }
@@ -363,16 +395,65 @@ function ziniaoControlPayload(store, marketplace) {
   };
 }
 
+function ziniaoRequestableAccounts(balance) {
+  return (balance?.accounts || []).filter((account) => account.canRequest);
+}
+
+function ziniaoAccountLabel(accountType) {
+  return {
+    "Standard Orders": "标准订单",
+    "Invoice Payment Orders": "发票支付订单",
+    "Deferred Transactions": "延迟交易",
+  }[accountType] || accountType;
+}
+
+function ziniaoAccountsFunds(balance) {
+  const accounts = balance?.accounts || [];
+  if (!accounts.length) return balance?.totalAvailable || "-";
+  return accounts.map((account) => `${ziniaoAccountLabel(account.accountType)} ${account.amount}`).join("；");
+}
+
+function ziniaoAccountsStatus(balance) {
+  const accounts = balance?.accounts || [];
+  if (!accounts.length) return "没有读取到账户余额";
+  return accounts
+    .map((account) => `${ziniaoAccountLabel(account.accountType)} ${account.amount}（${account.canRequest ? "可申请" : "跳过"}）`)
+    .join("；");
+}
+
+async function loadZiniaoBalanceForControl(control, marketplace) {
+  const params = new URLSearchParams(ziniaoControlPayload(control, marketplace));
+  return api(`/v1/ziniao/amazon/balance?${params.toString()}`);
+}
+
+async function prepareZiniaoAccounts(control, marketplace, balance) {
+  const preparedItems = [];
+  const errors = [];
+  for (const account of ziniaoRequestableAccounts(balance)) {
+    try {
+      const prepared = await api("/v1/ziniao/amazon/prepare", {
+        method: "POST",
+        body: JSON.stringify({
+          ...ziniaoControlPayload(control, marketplace),
+          accountIndex: account.index,
+        }),
+      });
+      preparedItems.push({ account, prepared });
+    } catch (error) {
+      errors.push({ account, error });
+    }
+  }
+  return { preparedItems, errors };
+}
+
 async function readZiniaoBalance(store, running, marketplace, button) {
   setBusy(button, true);
   try {
-    const params = new URLSearchParams(ziniaoControlPayload(running || store, marketplace));
-    const payload = await api(`/v1/ziniao/amazon/balance?${params.toString()}`);
+    const payload = await loadZiniaoBalanceForControl(running || store, marketplace);
     state.ziniaoBalances.set(ziniaoBalanceKey(store, marketplace), payload);
     renderZiniaoStores(state.ziniaoStores, state.ziniaoRunningItems);
-    const standard = (payload.accounts || []).find((item) => item.index === 0);
     elements.ziniaoResult.className = "result-strip good";
-    elements.ziniaoResult.textContent = `${store.browserName}：${standard?.accountType || "标准订单"} ${standard?.amount || "-"}，${standard?.canRequest ? "可申请付款" : "当前不可申请"}`;
+    elements.ziniaoResult.textContent = `${store.browserName}：${ziniaoAccountsStatus(payload)}`;
   } catch (error) {
     elements.ziniaoResult.className = "result-strip bad";
     elements.ziniaoResult.textContent = `${error.code || "ERROR"}: ${error.message}`;
@@ -384,25 +465,45 @@ async function readZiniaoBalance(store, running, marketplace, button) {
 async function prepareZiniaoPayout(store, running, marketplace, button) {
   setBusy(button, true);
   try {
-    const prepared = await api("/v1/ziniao/amazon/prepare", {
-      method: "POST",
-      body: JSON.stringify(ziniaoControlPayload(running || store, marketplace)),
-    });
+    const control = running || store;
+    const balance = await loadZiniaoBalanceForControl(control, marketplace);
+    state.ziniaoBalances.set(ziniaoBalanceKey(store, marketplace), balance);
+    const { preparedItems, errors } = await prepareZiniaoAccounts(control, marketplace, balance);
+    if (!preparedItems.length) {
+      elements.ziniaoResult.className = "result-strip bad";
+      elements.ziniaoResult.textContent = errors.length
+        ? `${marketplace} 准备失败：${errors.map((item) => `${ziniaoAccountLabel(item.account.accountType)} ${item.error.code || "ERROR"}`).join("；")}`
+        : `${marketplace} 当前没有可申请付款的账户`;
+      return;
+    }
+    const summary = preparedItems
+      .map(({ prepared }) => `${ziniaoAccountLabel(prepared.accountType)} · ${prepared.amount} · 收款账户尾号 ${prepared.accountTail}`)
+      .join("\n");
     const confirmed = window.confirm(
-      `确认向 Amazon ${marketplace} 站真实请求付款？\n\n金额：${prepared.amount}\n收款账户尾号：${prepared.accountTail}\n\n该操作会转移真实资金，提交后不要重复点击。`,
+      `确认向 Amazon ${marketplace} 站真实请求以下付款？\n\n${summary}\n\n不可申请或零余额账户已自动跳过。该操作会转移真实资金，提交后不要重复点击。`,
     );
     if (!confirmed) {
       elements.ziniaoResult.className = "result-strip";
       elements.ziniaoResult.textContent = `${store.browserName} 付款申请已取消`;
       return;
     }
-    const result = await api("/v1/ziniao/amazon/submit", {
-      method: "POST",
-      headers: { "X-Ziniao-Payout-Confirmation": `CONFIRM:${prepared.token}` },
-      body: JSON.stringify({ ...ziniaoControlPayload(running || store, marketplace), token: prepared.token }),
-    });
-    elements.ziniaoResult.className = result.status === "submitted" ? "result-strip good" : "result-strip bad";
-    elements.ziniaoResult.textContent = `${store.browserName}：${result.message}，金额 ${result.amount}，账户尾号 ${result.accountTail}`;
+    const results = [];
+    for (const item of preparedItems) {
+      try {
+        const result = await api("/v1/ziniao/amazon/submit", {
+          method: "POST",
+          headers: { "X-Ziniao-Payout-Confirmation": `CONFIRM:${item.prepared.token}` },
+          body: JSON.stringify({ ...ziniaoControlPayload(control, marketplace), token: item.prepared.token }),
+        });
+        results.push({ accountType: item.prepared.accountType, result });
+      } catch (error) {
+        results.push({ accountType: item.prepared.accountType, error });
+      }
+    }
+    const failures = results.filter((item) => item.error || item.result?.status !== "submitted");
+    elements.ziniaoResult.className = failures.length ? "result-strip bad" : "result-strip good";
+    elements.ziniaoResult.textContent = `${store.browserName}：${results.map((item) => `${ziniaoAccountLabel(item.accountType)} ${item.error?.code || item.result.status}`).join("；")}`;
+    renderZiniaoStores(state.ziniaoStores, state.ziniaoRunningItems);
   } catch (error) {
     elements.ziniaoResult.className = "result-strip bad";
     elements.ziniaoResult.textContent = `${error.code || "ERROR"}: ${error.message}`;
@@ -427,13 +528,7 @@ async function waitForZiniaoStore(store, attempts = 20) {
 }
 
 function configuredZiniaoStore(marketplace) {
-  const available = state.ziniaoStores.filter((store) => !store.isExpired);
-  const exact = available.find((store) => ziniaoMarketplace(store) === marketplace);
-  if (exact) return exact;
-  return available.find((store) => {
-    const source = `${store.platformName || ""} ${store.browserName || ""}`.toUpperCase();
-    return source.includes("亚马逊") || source.includes("AMAZON") || ZINIAO_MARKETPLACES.includes(ziniaoMarketplace(store));
-  });
+  return ziniaoStoreForMarketplace(state.ziniaoStores, marketplace);
 }
 
 function runningZiniaoStore(store) {
@@ -471,11 +566,25 @@ async function batchZiniaoPayout() {
       let running = runningZiniaoStore(store);
       try {
         if (!running?.debuggingPort) running = await ensureZiniaoStoreRunning(store);
-        const prepared = await api("/v1/ziniao/amazon/prepare", {
-          method: "POST",
-          body: JSON.stringify(ziniaoControlPayload(running || store, marketplace)),
+        const control = running || store;
+        const balance = await loadZiniaoBalanceForControl(control, marketplace);
+        state.ziniaoBalances.set(ziniaoBalanceKey(store, marketplace), balance);
+        const prepared = await prepareZiniaoAccounts(control, marketplace, balance);
+        prepared.preparedItems.forEach((item) => {
+          preparedItems.push({ store, running: control, marketplace, ...item });
         });
-        preparedItems.push({ store, running: running || store, marketplace, prepared });
+        prepared.errors.forEach((item) => {
+          skippedItems.push({
+            marketplace,
+            store: store.browserName,
+            accountType: item.account.accountType,
+            code: item.error.code || "ERROR",
+            message: item.error.message,
+          });
+        });
+        if (!prepared.preparedItems.length && !prepared.errors.length) {
+          skippedItems.push({ marketplace, store: store.browserName, code: "NO_REQUESTABLE_ACCOUNTS", message: "没有可申请账户" });
+        }
       } catch (error) {
         skippedItems.push({ marketplace, store: store.browserName, code: error.code || "ERROR", message: error.message });
       }
@@ -490,10 +599,10 @@ async function batchZiniaoPayout() {
       return;
     }
     const summary = preparedItems
-      .map((item) => `${item.marketplace} · ${item.prepared.amount} · 账户尾号 ${item.prepared.accountTail}`)
+      .map((item) => `${item.marketplace} · ${ziniaoAccountLabel(item.prepared.accountType)} · ${item.prepared.amount} · 账户尾号 ${item.prepared.accountTail}`)
       .join("\n");
     const confirmed = window.confirm(
-      `确认批量向 Amazon 请求真实付款？\n\n${summary}\n\n${missing.length ? `紫鸟中未找到：${missing.join("、")}\n\n` : ""}每个站点只提交一次，结果未知时不会自动重试。`,
+      `确认批量向 Amazon 请求真实付款？\n\n${summary}\n\n${missing.length ? `紫鸟中未找到：${missing.join("、")}\n\n` : ""}不可申请或零余额账户已自动跳过，每个账户只提交一次，结果未知时不会自动重试。`,
     );
     if (!confirmed) {
       elements.ziniaoResult.className = "result-strip";
@@ -503,7 +612,7 @@ async function batchZiniaoPayout() {
     const results = [];
     for (let index = 0; index < preparedItems.length; index += 1) {
       const item = preparedItems[index];
-      elements.ziniaoResult.textContent = `正在提交 ${item.marketplace}（${index + 1}/${preparedItems.length}）`;
+      elements.ziniaoResult.textContent = `正在提交 ${item.marketplace} · ${ziniaoAccountLabel(item.prepared.accountType)}（${index + 1}/${preparedItems.length}）`;
       try {
         const result = await api("/v1/ziniao/amazon/submit", {
           method: "POST",
@@ -513,9 +622,9 @@ async function batchZiniaoPayout() {
             token: item.prepared.token,
           }),
         });
-        results.push(`${item.marketplace}: ${result.status}`);
+        results.push(`${item.marketplace} ${ziniaoAccountLabel(item.prepared.accountType)}: ${result.status}`);
       } catch (error) {
-        results.push(`${item.marketplace}: ${error.code || "ERROR"}`);
+        results.push(`${item.marketplace} ${ziniaoAccountLabel(item.prepared.accountType)}: ${error.code || "ERROR"}`);
       }
     }
     elements.ziniaoResult.className = results.every((item) => item.endsWith(": submitted")) ? "result-strip good" : "result-strip bad";
@@ -596,13 +705,15 @@ async function collectAllSiteData() {
         const running = await ensureZiniaoStoreRunning(store);
         const params = new URLSearchParams(ziniaoControlPayload(running, marketplace));
         const balance = await api(`/v1/ziniao/amazon/balance?${params.toString()}`);
-        const standard = (balance.accounts || []).find((account) => account.index === 0);
-        const requestable = Boolean(standard?.canRequest && state.status?.ziniaoPayoutEnabled);
+        const requestableAccounts = ziniaoRequestableAccounts(balance);
+        const requestable = Boolean(requestableAccounts.length && state.status?.ziniaoPayoutEnabled);
         state.ziniaoBalances.set(ziniaoBalanceKey(store, marketplace), balance);
         updateAllSite(marketplace, {
           target: store.browserName,
-          funds: standard?.amount || balance.totalAvailable || "-",
-          eligibility: requestable ? "可申请付款" : (standard?.canRequest ? "付款开关关闭" : "当前不可申请"),
+          funds: ziniaoAccountsFunds(balance),
+          eligibility: requestable
+            ? `${requestableAccounts.length} 个账户可申请`
+            : (requestableAccounts.length ? "付款开关关闭" : "当前没有可申请账户"),
           eligibilityTone: requestable ? "SUBMITTED" : "FAILED",
           requestable,
           store,
@@ -691,12 +802,22 @@ async function applyAllSitePayouts() {
       elements.allSitesResult.className = "result-strip";
       elements.allSitesResult.textContent = `正在准备 ${item.marketplace} 付款确认（${index + 1}/${ziniaoTargets.length}）`;
       try {
-        const prepared = await api("/v1/ziniao/amazon/prepare", {
-          method: "POST",
-          body: JSON.stringify(ziniaoControlPayload(item.running, item.marketplace)),
+        const prepared = await prepareZiniaoAccounts(item.running, item.marketplace, item.balance);
+        prepared.preparedItems.forEach((preparedItem) => {
+          preparedZiniao.push({ ...item, ...preparedItem });
         });
-        preparedZiniao.push({ ...item, prepared });
-        updateAllSite(item.marketplace, { runResult: `待确认 · ${prepared.amount}`, runTone: "PENDING" });
+        prepared.errors.forEach((preparedError) => {
+          results.push({
+            marketplace: item.marketplace,
+            accountType: preparedError.account.accountType,
+            error: preparedError.error,
+          });
+        });
+        const count = prepared.preparedItems.length;
+        updateAllSite(item.marketplace, {
+          runResult: count ? `待确认 · ${count} 个账户` : (prepared.errors[0]?.error.code || "没有可申请账户"),
+          runTone: count ? "PENDING" : "FAILED",
+        });
       } catch (error) {
         results.push({ marketplace: item.marketplace, error });
         updateAllSite(item.marketplace, { runResult: error.code || "准备失败", runTone: "FAILED" });
@@ -715,14 +836,14 @@ async function applyAllSitePayouts() {
         summaryLines.push(`Transfers API：${apiTargets.map((item) => `${item.marketplace}（${item.target}）`).join("、")}；金额由 Amazon 按当前可用余额确定`);
       }
       preparedZiniao.forEach((item) => {
-        summaryLines.push(`${item.marketplace} · ${item.prepared.amount} · 收款账户尾号 ${item.prepared.accountTail}`);
+        summaryLines.push(`${item.marketplace} · ${ziniaoAccountLabel(item.prepared.accountType)} · ${item.prepared.amount} · 收款账户尾号 ${item.prepared.accountTail}`);
       });
       const skipped = ALL_MARKETPLACES.filter((marketplace) => {
         return !apiTargets.some((item) => item.marketplace === marketplace)
           && !preparedZiniao.some((item) => item.marketplace === marketplace);
       });
       const confirmed = window.confirm(
-        `确认向所有当前可用站点请求真实付款？\n\n${summaryLines.join("\n")}\n\n${skipped.length ? `本次不处理：${skipped.join("、")}\n\n` : ""}提交后结果未知的站点不会自动重试。`,
+        `确认向所有当前可用站点请求真实付款？\n\n${summaryLines.join("\n")}\n\n${skipped.length ? `本次不处理：${skipped.join("、")}\n\n` : ""}不可申请或零余额账户已自动跳过，提交后结果未知的账户不会自动重试。`,
       );
       if (!confirmed) {
         preparedZiniao.forEach((item) => updateAllSite(item.marketplace, { runResult: "已取消", runTone: "" }));
@@ -734,7 +855,7 @@ async function applyAllSitePayouts() {
 
     for (let index = 0; index < preparedZiniao.length; index += 1) {
       const item = preparedZiniao[index];
-      elements.allSitesResult.textContent = `正在提交 ${item.marketplace} Seller Central 付款（${index + 1}/${preparedZiniao.length}）`;
+      elements.allSitesResult.textContent = `正在提交 ${item.marketplace} · ${ziniaoAccountLabel(item.prepared.accountType)}（${index + 1}/${preparedZiniao.length}）`;
       try {
         const payload = await api("/v1/ziniao/amazon/submit", {
           method: "POST",
@@ -744,7 +865,7 @@ async function applyAllSitePayouts() {
             token: item.prepared.token,
           }),
         });
-        results.push({ marketplace: item.marketplace, status: payload.status, payload });
+        results.push({ marketplace: item.marketplace, accountType: item.prepared.accountType, status: payload.status, payload });
         updateAllSite(item.marketplace, {
           runResult: `${payload.status === "submitted" ? "已提交" : payload.status} · ${payload.amount}`,
           runTone: payload.status === "submitted" ? "SUBMITTED" : "FAILED",
@@ -1173,8 +1294,10 @@ async function syncFinance() {
 async function exportFinance() {
   setBusy(elements.exportFinanceButton, true);
   try {
+    const headers = new Headers();
+    if (state.apiKey) headers.set("X-API-Key", state.apiKey);
     const response = await fetch(`/v1/finance/export.csv?days=${encodeURIComponent(elements.financeDays.value)}`, {
-      headers: { "X-API-Key": state.apiKey },
+      headers,
     });
     if (!response.ok) throw new Error(`CSV 导出失败：HTTP ${response.status}`);
     const blob = await response.blob();
@@ -1204,14 +1327,25 @@ function scheduleRow(marketplace, schedule) {
     <td class="schedule-next">${schedule?.nextRunAt ? formatDate(schedule.nextRunAt) : "-"}</td>
     <td><div class="row-actions"><button type="button" class="button small secondary schedule-save">保存</button><button type="button" class="button small danger schedule-delete">关闭</button></div></td>
   `;
+  row.querySelector(".schedule-enabled").addEventListener("change", updateScheduleBulkSelection);
   row.querySelector(".schedule-save").addEventListener("click", () => saveSchedule(row));
   row.querySelector(".schedule-delete").addEventListener("click", () => deleteSchedule(row));
   return row;
 }
 
+function updateScheduleBulkSelection() {
+  const checkboxes = [...elements.schedulesBody.querySelectorAll(".schedule-enabled")];
+  const selectedCount = checkboxes.filter((checkbox) => checkbox.checked).length;
+  elements.scheduleSelectAll.checked = checkboxes.length > 0 && selectedCount === checkboxes.length;
+  elements.scheduleSelectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+}
+
 function renderSchedules(items) {
   state.schedules = new Map(items.map((item) => [item.marketplace, item]));
-  elements.schedulesBody.replaceChildren(...MARKETPLACES.map((marketplace) => scheduleRow(marketplace, state.schedules.get(marketplace))));
+  elements.schedulesBody.replaceChildren(...SCHEDULE_MARKETPLACES.map((marketplace) => scheduleRow(marketplace, state.schedules.get(marketplace))));
+  const enabledTimes = [...new Set(items.filter((item) => item.enabled).map((item) => item.runAt))];
+  if (enabledTimes.length === 1) elements.scheduleBulkTime.value = enabledTimes[0];
+  updateScheduleBulkSelection();
 }
 
 async function loadSchedules() {
@@ -1223,20 +1357,53 @@ async function saveSchedule(row) {
   const button = row.querySelector(".schedule-save");
   setBusy(button, true);
   try {
-    const marketplace = row.dataset.marketplace;
-    const payload = await api(`/v1/schedules/${marketplace}`, {
-      method: "PUT",
-      body: JSON.stringify({
-        enabled: row.querySelector(".schedule-enabled").checked,
-        runAt: row.querySelector(".schedule-time").value,
-      }),
-    });
+    const payload = await persistScheduleRow(row);
     row.querySelector(".schedule-next").textContent = formatDate(payload.nextRunAt);
-    showToast(`${marketplace} 每日任务已保存`);
+    showToast(`${row.dataset.marketplace} 每日任务已保存`);
   } catch (error) {
     showToast(`${error.code || "ERROR"}: ${error.message}`);
   } finally {
     setBusy(button, false);
+  }
+}
+
+async function persistScheduleRow(row) {
+  return api(`/v1/schedules/${row.dataset.marketplace}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      enabled: row.querySelector(".schedule-enabled").checked,
+      runAt: row.querySelector(".schedule-time").value,
+    }),
+  });
+}
+
+async function saveScheduleBatch() {
+  const runAt = elements.scheduleBulkTime.value;
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(runAt)) {
+    showToast("请选择统一执行时间");
+    return;
+  }
+  const rows = [...elements.schedulesBody.querySelectorAll("tr")];
+  setBusy(elements.scheduleBulkSaveButton, true);
+  rows.forEach((row) => {
+    row.querySelectorAll("button, input").forEach((control) => { control.disabled = true; });
+  });
+  try {
+    for (const row of rows) {
+      if (row.querySelector(".schedule-enabled").checked) row.querySelector(".schedule-time").value = runAt;
+      const payload = await persistScheduleRow(row);
+      row.querySelector(".schedule-next").textContent = formatDate(payload.nextRunAt);
+    }
+    const selectedCount = rows.filter((row) => row.querySelector(".schedule-enabled").checked).length;
+    showToast(`已保存 ${selectedCount} 个站点的每日任务`);
+  } catch (error) {
+    showToast(`${error.code || "ERROR"}: ${error.message}`);
+  } finally {
+    rows.forEach((row) => {
+      row.querySelectorAll("button, input").forEach((control) => { control.disabled = false; });
+    });
+    setBusy(elements.scheduleBulkSaveButton, false);
+    updateScheduleBulkSelection();
   }
 }
 
@@ -1248,6 +1415,7 @@ async function deleteSchedule(row) {
     await api(`/v1/schedules/${marketplace}`, { method: "DELETE" });
     row.querySelector(".schedule-enabled").checked = false;
     row.querySelector(".schedule-next").textContent = "-";
+    updateScheduleBulkSelection();
     showToast(`${marketplace} 每日任务已关闭`);
   } catch (error) {
     showToast(`${error.code || "ERROR"}: ${error.message}`);
@@ -1311,7 +1479,9 @@ async function testCredentials() {
 
 async function connect() {
   await loadStatus();
-  sessionStorage.setItem("amazonPayoutApiKey", state.apiKey);
+  state.connected = true;
+  if (state.apiKey) sessionStorage.setItem("amazonPayoutApiKey", state.apiKey);
+  else sessionStorage.removeItem("amazonPayoutApiKey");
   elements.authPanel.hidden = true;
   elements.workspace.hidden = false;
   await Promise.all([loadSchedules(), loadHistory(), loadFinance(), loadZiniaoStatus()]);
@@ -1373,22 +1543,30 @@ elements.syncFinanceButton.addEventListener("click", syncFinance);
 elements.exportFinanceButton.addEventListener("click", exportFinance);
 elements.refreshFinanceButton.addEventListener("click", () => loadFinance().catch((error) => showToast(error.message)));
 elements.refreshSchedulesButton.addEventListener("click", () => loadSchedules().catch((error) => showToast(error.message)));
+elements.scheduleSelectAll.addEventListener("change", () => {
+  elements.schedulesBody.querySelectorAll(".schedule-enabled").forEach((checkbox) => {
+    checkbox.checked = elements.scheduleSelectAll.checked;
+  });
+  updateScheduleBulkSelection();
+});
+elements.scheduleBulkSaveButton.addEventListener("click", saveScheduleBatch);
 elements.refreshHistoryButton.addEventListener("click", () => loadHistory().catch((error) => showToast(error.message)));
 
-if (state.apiKey) {
-  elements.apiKeyInput.value = state.apiKey;
-  connect().catch(() => disconnect());
-}
+if (state.apiKey) elements.apiKeyInput.value = state.apiKey;
+connect().catch((error) => {
+  disconnect();
+  showToast(error.message);
+});
 
 renderAllSites();
 
 window.setInterval(() => {
-  if (!state.apiKey || elements.workspace.hidden) return;
+  if (!state.connected || elements.workspace.hidden) return;
   Promise.all([loadStatus(), loadHistory(), loadZiniaoStatus()]).catch(() => {});
 }, 30_000);
 
 window.setInterval(() => {
-  if (!state.apiKey || elements.workspace.hidden) return;
+  if (!state.connected || elements.workspace.hidden) return;
   loadFinance().catch(() => {});
 }, 300_000);
 

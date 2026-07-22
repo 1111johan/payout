@@ -36,6 +36,8 @@ class PreparedPayout:
     control_type: str
     control_id: str
     marketplace: str
+    account_index: int
+    account_type: str
     amount: str
     account_tail: str
     expires_at: datetime
@@ -58,14 +60,20 @@ class ZiniaoAmazonPayout:
             finally:
                 driver.service.stop()
 
-    def prepare(self, control_type: str, control_id: str, marketplace: str) -> dict[str, Any]:
+    def prepare(
+        self,
+        control_type: str,
+        control_id: str,
+        marketplace: str,
+        account_index: int = 0,
+    ) -> dict[str, Any]:
         with self._lock:
             store = self._running_store(control_type, control_id)
             driver = self._driver(store)
             try:
                 state = self._dashboard(driver, marketplace)
-                self._require_standard_request(state)
-                self._click_request_payment(driver, 0)
+                account = self._require_account_request(state, account_index)
+                self._click_request_payment(driver, account_index)
                 confirmation = self._confirmation_state(driver)
                 token = secrets.token_urlsafe(32)
                 prepared = PreparedPayout(
@@ -73,6 +81,8 @@ class ZiniaoAmazonPayout:
                     control_type=control_type,
                     control_id=control_id,
                     marketplace=marketplace.strip().upper(),
+                    account_index=account_index,
+                    account_type=str(account["accountType"]),
                     amount=confirmation["amount"],
                     account_tail=confirmation["accountTail"],
                     expires_at=datetime.now(timezone.utc) + timedelta(seconds=self.settings.ziniao_prepare_ttl_seconds),
@@ -83,6 +93,8 @@ class ZiniaoAmazonPayout:
                     "status": "confirmation_required",
                     "token": token,
                     "marketplace": marketplace.upper(),
+                    "accountIndex": prepared.account_index,
+                    "accountType": prepared.account_type,
                     "amount": prepared.amount,
                     "accountTail": prepared.account_tail,
                     "expiresAt": prepared.expires_at.isoformat(),
@@ -113,8 +125,12 @@ class ZiniaoAmazonPayout:
             driver = self._driver(store)
             try:
                 state = self._dashboard(driver, prepared.marketplace)
-                self._require_standard_request(state)
-                self._click_request_payment(driver, 0)
+                self._require_account_request(
+                    state,
+                    prepared.account_index,
+                    expected_type=prepared.account_type,
+                )
+                self._click_request_payment(driver, prepared.account_index)
                 current = self._confirmation_state(driver)
                 if current["amount"] != prepared.amount or current["accountTail"] != prepared.account_tail:
                     raise AmazonApiError(
@@ -135,6 +151,9 @@ class ZiniaoAmazonPayout:
                 result = self._wait_for_result(driver, before_url, before_text)
                 return {
                     "status": result["status"],
+                    "marketplace": prepared.marketplace,
+                    "accountIndex": prepared.account_index,
+                    "accountType": prepared.account_type,
                     "amount": prepared.amount,
                     "accountTail": prepared.account_tail,
                     "pageUrl": driver.current_url,
@@ -182,12 +201,16 @@ class ZiniaoAmazonPayout:
             )
         accounts = []
         for index, label in enumerate(last_state["labels"]):
+            amount = str(last_state["amounts"][index])
             accounts.append(
                 {
                     "index": index,
-                    "accountType": label,
-                    "amount": last_state["amounts"][index],
-                    "canRequest": not bool(last_state["buttons"][index]["disabled"]),
+                    "accountType": self._canonical_account_type(str(label)),
+                    "amount": amount,
+                    "canRequest": (
+                        not bool(last_state["buttons"][index]["disabled"])
+                        and self._amount_is_positive(amount)
+                    ),
                 }
             )
         return {
@@ -201,7 +224,19 @@ class ZiniaoAmazonPayout:
         driver.get(ACCOUNT_SWITCHER_URL)
         deadline = time.monotonic() + self.settings.ziniao_amazon_page_timeout_seconds
         option = None
+        authentication_completed = False
         while time.monotonic() < deadline:
+            if any(path in driver.current_url for path in ("/ap/signin", "/ap/mfa", "/ap/cvf", "/ap/challenge")):
+                if authentication_completed:
+                    raise AmazonApiError(
+                        409,
+                        "ZINIAO_AMAZON_REAUTH_FAILED",
+                        "Amazon returned to authentication while opening the marketplace switcher",
+                    )
+                self._complete_autofilled_authentication(driver)
+                authentication_completed = True
+                driver.get(ACCOUNT_SWITCHER_URL)
+                continue
             options = driver.find_elements("css selector", "button.full-page-account-switcher-account-details")
             labels = MARKETPLACE_SWITCH_LABELS[code]
             option = next(
@@ -246,14 +281,49 @@ class ZiniaoAmazonPayout:
         )
 
     @staticmethod
-    def _require_standard_request(state: dict[str, Any]) -> None:
-        standard = next((item for item in state.get("accounts", []) if item.get("index") == 0), None)
-        if standard is None or not standard.get("canRequest"):
+    def _canonical_account_type(label: str) -> str:
+        known_types = {
+            "standard orders": "Standard Orders",
+            "标准订单": "Standard Orders",
+            "invoice payment orders": "Invoice Payment Orders",
+            "发票支付订单": "Invoice Payment Orders",
+            "deferred transactions": "Deferred Transactions",
+            "延迟交易": "Deferred Transactions",
+        }
+        normalized = " ".join(label.split()).casefold()
+        return known_types.get(normalized, " ".join(label.split()))
+
+    @staticmethod
+    def _amount_is_positive(amount: str) -> bool:
+        return any(character in "123456789" for character in amount)
+
+    @staticmethod
+    def _require_account_request(
+        state: dict[str, Any],
+        account_index: int,
+        *,
+        expected_type: str | None = None,
+    ) -> dict[str, Any]:
+        account = next((item for item in state.get("accounts", []) if item.get("index") == account_index), None)
+        if account is None:
             raise AmazonApiError(
                 422,
-                "ZINIAO_STANDARD_ORDERS_UNAVAILABLE",
-                "The Standard Orders account does not currently allow a payment request",
+                "ZINIAO_ACCOUNT_NOT_FOUND",
+                "Amazon no longer exposes the selected payment account",
             )
+        if expected_type is not None and account.get("accountType") != expected_type:
+            raise AmazonApiError(
+                409,
+                "ZINIAO_ACCOUNT_CHANGED",
+                "The selected Amazon payment account changed after preparation",
+            )
+        if not account.get("canRequest"):
+            raise AmazonApiError(
+                422,
+                "ZINIAO_ACCOUNT_UNAVAILABLE",
+                f"The {account.get('accountType') or 'selected'} account does not currently allow a payment request",
+            )
+        return account
 
     @staticmethod
     def _click_request_payment(driver: Any, index: int) -> None:
@@ -269,7 +339,7 @@ class ZiniaoAmazonPayout:
             raise AmazonApiError(
                 409,
                 "ZINIAO_REQUEST_BUTTON_UNAVAILABLE",
-                "Amazon no longer exposes an enabled request-payment button for Standard Orders",
+                "Amazon no longer exposes an enabled request-payment button for the selected account",
             )
 
     def _confirmation_state(self, driver: Any) -> dict[str, str]:
@@ -350,23 +420,35 @@ class ZiniaoAmazonPayout:
 
     def _complete_autofilled_signin(self, driver: Any) -> None:
         deadline = time.monotonic() + min(30, self.settings.ziniao_amazon_page_timeout_seconds)
-        clicked = False
+        clicked_account = False
+        clicked_password = False
         while time.monotonic() < deadline:
             if "/ap/signin" not in driver.current_url:
                 return
-            if not clicked:
-                clicked = bool(
-                    driver.execute_script(
-                        "const username=document.querySelector('input[type=email],input[name=email],input[name=username],#ap_email');"
-                        "const password=document.querySelector('input[type=password],#ap_password');"
-                        "const submit=document.querySelector('#signInSubmit,input[type=submit],button[type=submit]');"
-                        "if(!password||!password.value||!submit){return false;}"
-                        "if(username&&!username.value){return false;}"
-                        "submit.click();return true;"
-                    )
+            action = str(
+                driver.execute_script(
+                    "const password=document.querySelector('input[type=password],#ap_password');"
+                    "if(!password&&!arguments[0]){"
+                    "const accounts=[...document.querySelectorAll('a.cvf-widget-btn-verify-account-switcher')].filter(x=>x.getClientRects().length);"
+                    "if(accounts.length===1){accounts[0].click();return 'account';}"
+                    "}"
+                    "if(password&&!arguments[1]){"
+                    "const username=document.querySelector('input[type=email],input[name=email],input[name=username],#ap_email');"
+                    "const submit=document.querySelector('#signInSubmit,input[type=submit],button[type=submit]');"
+                    "if(password.value&&submit&&(!username||username.value)){submit.click();return 'password';}"
+                    "}"
+                    "return '';",
+                    clicked_account,
+                    clicked_password,
                 )
+                or ""
+            )
+            if action == "account":
+                clicked_account = True
+            elif action == "password":
+                clicked_password = True
             time.sleep(0.5)
-        if not clicked:
+        if not clicked_account and not clicked_password:
             raise AmazonApiError(
                 409,
                 "ZINIAO_AMAZON_REAUTH_REQUIRED",

@@ -4,11 +4,13 @@ from datetime import datetime, timedelta, timezone
 import csv
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import io
 import json
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -23,7 +25,21 @@ from .ziniao_amazon import ZiniaoAmazonPayout
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 SCHEDULE_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 SCHEDULE_PATH_PATTERN = re.compile(r"^/v1/schedules/([A-Za-z]{2})$")
+ZINIAO_MARKETPLACES = ("US", "UK", "CA")
+SCHEDULABLE_MARKETPLACES = (*ZINIAO_MARKETPLACES, *SUPPORTED_MARKETPLACES)
+TRANSFER_SCHEDULE_SPACING_SECONDS = 65
+ZINIAO_PAYOUT_INTERVAL = timedelta(hours=24, minutes=10)
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+
+
+def resolve_scheduled_marketplace(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized == "GB":
+        normalized = "UK"
+    if normalized in ZINIAO_MARKETPLACES:
+        return normalized
+    code, _ = resolve_marketplace(normalized)
+    return code
 
 
 class PayoutApplication:
@@ -101,10 +117,14 @@ class PayoutApplication:
         return 200, self.ziniao_payout.balance(control_type, control_id, marketplace)
 
     def ziniao_amazon_prepare(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        account_index = payload.get("accountIndex", 0)
+        if isinstance(account_index, bool) or not isinstance(account_index, int) or account_index < 0:
+            raise AmazonApiError(422, "INVALID_ZINIAO_ACCOUNT_INDEX", "accountIndex must be a non-negative integer")
         return 200, self.ziniao_payout.prepare(
             str(payload.get("controlType") or ""),
             str(payload.get("controlId") or ""),
             str(payload.get("marketplace") or ""),
+            account_index,
         )
 
     def ziniao_amazon_submit(self, payload: dict[str, Any], confirmation: str) -> tuple[int, dict[str, Any]]:
@@ -275,27 +295,290 @@ class PayoutApplication:
         return None
 
     def auto_payout_blockers(self, marketplace: str) -> list[str]:
+        marketplace = resolve_scheduled_marketplace(marketplace)
         blockers: list[str] = []
         if self.settings.mode != "production":
             blockers.append("AUTO_REQUIRES_PRODUCTION")
         if self.settings.dry_run:
             blockers.append("DRY_RUN_ENABLED")
-        if not self.settings.credentials_complete:
-            blockers.append("CREDENTIALS_INCOMPLETE")
         if not self.settings.allow_production:
             blockers.append("ALLOW_PRODUCTION_DISABLED")
         if not self.settings.allow_payout_post:
             blockers.append("ALLOW_PAYOUT_POST_DISABLED")
+        if marketplace in ZINIAO_MARKETPLACES:
+            if not self.settings.ziniao_enabled:
+                blockers.append("ZINIAO_DISABLED")
+            if not self.ziniao.configured:
+                blockers.append("ZINIAO_CONFIGURATION_INCOMPLETE")
+            if not self.settings.allow_ziniao_payout:
+                blockers.append("ALLOW_ZINIAO_PAYOUT_DISABLED")
+        elif not self.settings.credentials_complete:
+            blockers.append("CREDENTIALS_INCOMPLETE")
         if marketplace not in self.settings.auto_payout_marketplaces:
             blockers.append("MARKETPLACE_NOT_ALLOWLISTED")
         return blockers
 
+    def scheduled_payout(self, marketplace: str, idempotency_key: str) -> tuple[int, dict[str, Any]]:
+        code = resolve_scheduled_marketplace(marketplace)
+        if code not in ZINIAO_MARKETPLACES:
+            return self.payout(
+                {"marketplace": code, "accountType": "Standard Orders"},
+                idempotency_key,
+                f"CONFIRM:{code}",
+                trigger_source="auto",
+            )
+        if self.settings.dry_run:
+            response = {
+                "status": "PREVIEW_ONLY",
+                "marketplace": code,
+                "channel": "ZINIAO_SELLER_CENTRAL",
+            }
+            self.store.record_event(idempotency_key, code, "Standard Orders", "auto", "PREVIEW_ONLY", 200)
+            return 200, response
+        with self._payout_lock:
+            return self._scheduled_ziniao_payout_locked(code, idempotency_key)
+
+    def _scheduled_ziniao_payout_locked(self, marketplace: str, idempotency_key: str) -> tuple[int, dict[str, Any]]:
+        try:
+            store = self._ensure_ziniao_store_running(self._configured_ziniao_store(marketplace))
+            control_type = str(store.get("controlType") or "")
+            control_id = str(store.get("controlId") or "")
+            balance = self.ziniao_payout.balance(control_type, control_id, marketplace)
+        except AmazonApiError as error:
+            self.store.record_event(
+                f"{idempotency_key}-scan",
+                marketplace,
+                "All Seller Central Accounts",
+                "auto",
+                "FAILED",
+                error.status,
+                error_code=error.code,
+                error_message=error.message,
+            )
+            self.store.mark_schedule_run(idempotency_key, marketplace)
+            raise
+
+        accounts = [account for account in balance.get("accounts", []) if account.get("canRequest")]
+        items: list[dict[str, Any]] = []
+        errors: list[AmazonApiError] = []
+        for account in accounts:
+            item, error = self._scheduled_ziniao_account_locked(
+                marketplace,
+                idempotency_key,
+                control_type,
+                control_id,
+                account,
+            )
+            items.append(item)
+            if error is not None:
+                errors.append(error)
+
+        self.store.mark_schedule_run(idempotency_key, marketplace)
+        statuses = {str(item.get("status") or "") for item in items}
+        if "UNKNOWN" in statuses:
+            aggregate_status = "UNKNOWN"
+        elif "SUBMITTED" in statuses and "FAILED" in statuses:
+            aggregate_status = "PARTIAL"
+        elif "FAILED" in statuses:
+            aggregate_status = "FAILED"
+        elif "SUBMITTED" in statuses:
+            aggregate_status = "SUBMITTED"
+        else:
+            aggregate_status = "SKIPPED"
+
+        if "SUBMITTED" in statuses:
+            self._reschedule_ziniao_after_success(marketplace)
+        if errors and "SUBMITTED" not in statuses:
+            raise errors[0]
+        return 200, {
+            "status": aggregate_status,
+            "marketplace": marketplace,
+            "channel": "ZINIAO_SELLER_CENTRAL",
+            "items": items,
+        }
+
+    def _scheduled_ziniao_account_locked(
+        self,
+        marketplace: str,
+        base_idempotency_key: str,
+        control_type: str,
+        control_id: str,
+        account: dict[str, Any],
+    ) -> tuple[dict[str, Any], AmazonApiError | None]:
+        account_index = int(account["index"])
+        account_type = str(account.get("accountType") or f"Account {account_index}")
+        idempotency_key = f"{base_idempotency_key}-a{account_index}"
+        normalized = {
+            "marketplace": marketplace,
+            "channel": "ZINIAO_SELLER_CENTRAL",
+            "accountIndex": account_index,
+            "accountType": account_type,
+        }
+        request_hash = self.store.request_hash(normalized)
+        try:
+            claim = self.store.claim(
+                idempotency_key,
+                request_hash,
+                marketplace,
+                account_type,
+                "auto",
+                enforce_interval=True,
+            )
+        except PayoutStoreError as error:
+            status_code = 429 if error.code == "PAYOUT_INTERVAL_LIMIT" else 409
+            self.store.record_event(
+                idempotency_key,
+                marketplace,
+                account_type,
+                "auto",
+                "SKIPPED",
+                status_code,
+                error_code=error.code,
+                error_message=error.message,
+            )
+            return {
+                "status": "SKIPPED",
+                "accountIndex": account_index,
+                "accountType": account_type,
+                "amount": account.get("amount"),
+                "error": {"code": error.code, "message": error.message},
+            }, None
+        if not claim["created"]:
+            return {
+                "status": "SKIPPED",
+                "accountIndex": account_index,
+                "accountType": account_type,
+                "amount": account.get("amount"),
+                "error": {"code": "IDEMPOTENCY_UNRESOLVED", "message": "This account was already processed"},
+            }, None
+
+        try:
+            prepared = self.ziniao_payout.prepare(control_type, control_id, marketplace, account_index)
+            result = self.ziniao_payout.submit(
+                control_type,
+                control_id,
+                str(prepared.get("token") or ""),
+                f"CONFIRM:{prepared.get('token') or ''}",
+            )
+        except AmazonApiError as error:
+            run_status = "UNKNOWN" if error.code == "ZINIAO_PAYOUT_RESULT_UNKNOWN" else "FAILED"
+            response = {
+                "status": run_status,
+                "marketplace": marketplace,
+                "channel": "ZINIAO_SELLER_CENTRAL",
+                "accountIndex": account_index,
+                "accountType": account_type,
+                "error": {"code": error.code, "message": error.message},
+            }
+            self.store.finish_claim(
+                idempotency_key,
+                run_status,
+                error.status,
+                response,
+                error_code=error.code,
+                error_message=error.message,
+            )
+            return response, error
+
+        submitted = str(result.get("status") or "").lower() == "submitted"
+        response = {
+            "status": "SUBMITTED" if submitted else "FAILED",
+            "marketplace": marketplace,
+            "channel": "ZINIAO_SELLER_CENTRAL",
+            "accountIndex": account_index,
+            "accountType": account_type,
+            "amount": result.get("amount") or prepared.get("amount"),
+            "accountTail": result.get("accountTail") or prepared.get("accountTail"),
+            "message": result.get("message"),
+        }
+        self.store.finish_claim(idempotency_key, "COMPLETED" if submitted else "FAILED", 200, response)
+        return response, None
+
+    def _reschedule_ziniao_after_success(self, marketplace: str) -> None:
+        local_next = datetime.now(timezone.utc).astimezone(ZoneInfo(self.settings.timezone)) + timedelta(minutes=10)
+        if local_next.second or local_next.microsecond:
+            local_next = local_next.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        self.store.save_schedule(marketplace, True, local_next.strftime("%H:%M"), self.settings.timezone)
+
+    def _configured_ziniao_store(self, marketplace: str) -> dict[str, Any]:
+        status = self.ziniao.status()
+        if not status.get("serviceReachable"):
+            self.ziniao.start_client()
+        stores = [store for store in self.ziniao.list_stores() if not store.get("isExpired")]
+        labels = {
+            "US": ("UNITED STATES", "美国", "US"),
+            "UK": ("UNITED KINGDOM", "英国", "UK", "GB"),
+            "CA": ("CANADA", "加拿大", "CA"),
+        }[marketplace]
+
+        def source(store: dict[str, Any]) -> str:
+            return f"{store.get('platformName') or ''} {store.get('browserName') or ''}".upper()
+
+        exact = next(
+            (
+                store
+                for store in stores
+                if any(
+                    label in source(store) if len(label) > 2 else re.search(rf"(^|\W){label}(\W|$)", source(store))
+                    for label in labels
+                )
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+        shared = next((store for store in stores if "亚马逊" in source(store) or "AMAZON" in source(store)), None)
+        if shared is not None:
+            return shared
+        raise AmazonApiError(409, "ZINIAO_STORE_NOT_CONFIGURED", f"No authorized Ziniao store is available for {marketplace}")
+
+    @staticmethod
+    def _ziniao_store_identifiers(store: dict[str, Any]) -> set[str]:
+        return {
+            str(store.get("browserId") or ""),
+            str(store.get("browserOauth") or ""),
+            str(store.get("controlId") or ""),
+        } - {""}
+
+    def _running_ziniao_store(self, configured_store: dict[str, Any]) -> dict[str, Any] | None:
+        identifiers = self._ziniao_store_identifiers(configured_store)
+        for running_store in self.ziniao.running_stores():
+            if identifiers.intersection(self._ziniao_store_identifiers(running_store)):
+                return running_store
+        return None
+
+    def _ensure_ziniao_store_running(self, configured_store: dict[str, Any]) -> dict[str, Any]:
+        running_store = self._running_ziniao_store(configured_store)
+        if running_store is not None and running_store.get("debuggingPort"):
+            return running_store
+        self.ziniao.start_store(
+            str(configured_store.get("controlType") or ""),
+            str(configured_store.get("controlId") or ""),
+        )
+        deadline = time.monotonic() + self.settings.ziniao_start_timeout_seconds
+        while time.monotonic() < deadline:
+            running_store = self._running_ziniao_store(configured_store)
+            if running_store is not None and running_store.get("debuggingPort"):
+                return running_store
+            time.sleep(0.5)
+        raise AmazonApiError(504, "ZINIAO_STORE_START_TIMEOUT", "Ziniao store did not expose a debugging port in time")
+
     def schedules(self) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
-        return [{**item, "nextRunAt": self._next_run(item, now).isoformat()} for item in self.store.schedules()]
+        schedules = []
+        for item in self.store.schedules():
+            next_run = self._next_run(item, now)
+            if item["marketplace"] in ZINIAO_MARKETPLACES:
+                last_submitted = self.store.latest_submitted_at(item["marketplace"])
+                if last_submitted is not None:
+                    eligible_at = last_submitted + ZINIAO_PAYOUT_INTERVAL
+                    while next_run < eligible_at:
+                        next_run += timedelta(days=1)
+            schedules.append({**item, "nextRunAt": next_run.isoformat()})
+        return schedules
 
     def save_schedule(self, marketplace: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        code, _ = resolve_marketplace(marketplace)
+        code = resolve_scheduled_marketplace(marketplace)
         run_at = str(payload.get("runAt") or "")
         if not SCHEDULE_TIME_PATTERN.fullmatch(run_at):
             raise AmazonApiError(422, "INVALID_SCHEDULE_TIME", "runAt must use 24-hour HH:MM format")
@@ -307,14 +590,14 @@ class PayoutApplication:
         return 200, schedule
 
     def delete_schedule(self, marketplace: str) -> tuple[int, dict[str, Any]]:
-        code, _ = resolve_marketplace(marketplace)
+        code = resolve_scheduled_marketplace(marketplace)
         deleted = self.store.delete_schedule(code)
         return 200, {"marketplace": code, "deleted": deleted}
 
     def history(self, limit: int, marketplace: str | None) -> tuple[int, dict[str, Any]]:
         code = None
         if marketplace:
-            code, _ = resolve_marketplace(marketplace)
+            code = resolve_scheduled_marketplace(marketplace)
         return 200, {"items": self.store.history(limit, code)}
 
     def sync_finance(self, days: int | None = None) -> tuple[int, dict[str, Any]]:
@@ -459,17 +742,34 @@ class ScheduleRunner(threading.Thread):
 
     def run_due(self, now_utc: datetime | None = None) -> None:
         now_utc = now_utc or datetime.now(timezone.utc)
-        for schedule in self.app.store.schedules():
+        rank = {marketplace: index for index, marketplace in enumerate(SCHEDULABLE_MARKETPLACES)}
+        schedules = sorted(self.app.store.schedules(), key=lambda item: rank.get(item["marketplace"], len(rank)))
+        due_schedules = []
+        for schedule in schedules:
             if not schedule["enabled"]:
                 continue
             zone = ZoneInfo(str(schedule["timezone"]))
             local_now = now_utc.astimezone(zone)
-            if local_now.strftime("%H:%M") < schedule["runAt"]:
+            hour, minute = (int(value) for value in str(schedule["runAt"]).split(":"))
+            scheduled_today = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if local_now < scheduled_today:
+                continue
+            updated_at = datetime.fromisoformat(str(schedule["updatedAt"])).astimezone(zone)
+            if updated_at > scheduled_today:
                 continue
             marketplace = schedule["marketplace"]
-            key = f"auto-{marketplace}-{local_now.strftime('%Y%m%d')}"
+            if marketplace in ZINIAO_MARKETPLACES:
+                last_submitted = self.app.store.latest_submitted_at(marketplace)
+                if last_submitted is not None and now_utc < last_submitted + ZINIAO_PAYOUT_INTERVAL:
+                    continue
+                key = f"auto-{marketplace}-{local_now.strftime('%Y%m%d')}-{schedule['runAt'].replace(':', '')}"
+            else:
+                key = f"auto-{marketplace}-{local_now.strftime('%Y%m%d')}"
             if self.app.store.has_run(key):
                 continue
+            due_schedules.append((marketplace, key))
+
+        for index, (marketplace, key) in enumerate(due_schedules):
             if not self.app.settings.dry_run:
                 blockers = self.app.auto_payout_blockers(marketplace)
                 if blockers:
@@ -485,14 +785,15 @@ class ScheduleRunner(threading.Thread):
                     )
                     continue
             try:
-                self.app.payout(
-                    {"marketplace": marketplace, "accountType": "Standard Orders"},
-                    key,
-                    f"CONFIRM:{marketplace}",
-                    trigger_source="auto",
-                )
+                self.app.scheduled_payout(marketplace, key)
             except (AmazonApiError, ValueError) as error:
                 print(f"Scheduled payout {key} did not complete: {error}")
+            if (
+                not self.app.settings.dry_run
+                and marketplace in SUPPORTED_MARKETPLACES
+                and any(item[0] in SUPPORTED_MARKETPLACES for item in due_schedules[index + 1 :])
+            ):
+                self._stop_event.wait(TRANSFER_SCHEDULE_SPACING_SECONDS)
 
 
 class FinanceSyncRunner(threading.Thread):
@@ -568,6 +869,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._json(error.status, {"error": {"code": error.code, "message": error.message, "details": error.details}})
 
     def _require_auth(self) -> bool:
+        peer_host = self.client_address[0]
+        request_host = self.headers.get("Host", "")
+        try:
+            peer_is_loopback = ipaddress.ip_address(peer_host).is_loopback
+            parsed_host = urlparse(f"//{request_host}").hostname or ""
+            host_is_loopback = parsed_host.lower() == "localhost" or ipaddress.ip_address(parsed_host).is_loopback
+        except ValueError:
+            peer_is_loopback = False
+            host_is_loopback = False
+        if peer_is_loopback and host_is_loopback:
+            return True
         if self.app.authorize(self.headers.get("X-API-Key", "")):
             return True
         self._json(401, {"error": {"code": "UNAUTHORIZED", "message": "Valid X-API-Key required"}})

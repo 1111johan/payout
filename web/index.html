@@ -20,7 +20,7 @@
   </header>
 
   <main class="page-shell">
-    <section id="authPanel" class="auth-band" aria-labelledby="authTitle">
+    <section id="authPanel" class="auth-band" aria-labelledby="authTitle" hidden>
       <div>
         <h2 id="authTitle">控制台访问</h2>
         <p>API Key</p>
@@ -78,7 +78,7 @@
         <div class="table-wrap">
           <table class="ziniao-table">
             <thead>
-              <tr><th>店铺</th><th>平台</th><th>站点 ID</th><th>代理状态</th><th>调试端口</th><th>可用资金</th><th>操作</th></tr>
+              <tr><th>店铺</th><th>平台</th><th>站点</th><th>代理状态</th><th>调试端口</th><th>可用资金</th><th>操作</th></tr>
             </thead>
             <tbody id="ziniaoStoresBody">
               <tr><td colspan="7" class="empty-cell">配置紫鸟自动化账号后可读取店铺列表</td></tr>
@@ -204,6 +204,17 @@
             <p id="scheduleTimezone">-</p>
           </div>
           <button id="refreshSchedulesButton" type="button" class="button secondary">刷新</button>
+        </div>
+        <div class="schedule-bulk-toolbar">
+          <label class="schedule-select-all" for="scheduleSelectAll">
+            <input id="scheduleSelectAll" type="checkbox">
+            <span>全选站点</span>
+          </label>
+          <label class="schedule-time-control" for="scheduleBulkTime">
+            <span>统一执行时间</span>
+            <input id="scheduleBulkTime" type="time" value="09:00" required>
+          </label>
+          <button id="scheduleBulkSaveButton" type="button" class="button primary">批量保存</button>
         </div>
         <div class="table-wrap">
           <table class="schedule-table">

@@ -79,6 +79,12 @@ class PayoutStore:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS schedule_run_markers (
+                    idempotency_key TEXT PRIMARY KEY,
+                    marketplace TEXT NOT NULL,
+                    completed_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS app_state (
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL,
@@ -348,10 +354,55 @@ class PayoutStore:
 
     def has_run(self, key: str) -> bool:
         with self._connect() as connection:
-            return connection.execute(
+            payout_run = connection.execute(
                 "SELECT 1 FROM payout_runs WHERE idempotency_key = ?",
                 (key,),
+            ).fetchone()
+            if payout_run is not None:
+                return True
+            return connection.execute(
+                "SELECT 1 FROM schedule_run_markers WHERE idempotency_key = ?",
+                (key,),
             ).fetchone() is not None
+
+    def mark_schedule_run(self, key: str, marketplace: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schedule_run_markers
+                (idempotency_key, marketplace, completed_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, marketplace, int(time.time())),
+            )
+
+    def last_submitted_at(self, marketplace: str, account_type: str = "Standard Orders") -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT completed_at FROM payout_runs
+                WHERE marketplace = ? AND account_type = ? AND status = 'SUBMITTED'
+                ORDER BY completed_at DESC LIMIT 1
+                """,
+                (marketplace, account_type),
+            ).fetchone()
+        if row is None or row["completed_at"] is None:
+            return None
+        return datetime.fromtimestamp(int(row["completed_at"]), timezone.utc)
+
+    def latest_submitted_at(self, marketplace: str) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT completed_at FROM payout_runs
+                WHERE marketplace = ? AND status = 'SUBMITTED'
+                ORDER BY completed_at DESC LIMIT 1
+                """,
+                (marketplace,),
+            ).fetchone()
+        if row is None or row["completed_at"] is None:
+            return None
+        return datetime.fromtimestamp(int(row["completed_at"]), timezone.utc)
 
     def history(self, limit: int = 100, marketplace: str | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
